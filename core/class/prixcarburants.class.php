@@ -21,13 +21,14 @@
 use PhpParser\Node\Stmt\Switch_;
 
 require_once __DIR__  . '/../../../../core/php/core.inc.php';
-
+require_once 'pxc_station.class.php';
 class prixcarburants extends eqLogic
 {
 	/*     * *********************** Constant creation *************************** */
 
 	const DEFAULT_CRON = '7 2 * * *'; // cron by default if not set 
 	const ZIP_PATH = __DIR__ . '/../../data'; // file path for zip file, data and so on
+  	const PATH_TO_LOGO = '../../plugins/' . __CLASS__ . '/data/logo/';
 	const DEFAULT_CMD = array(
                               'id' => '',
                               'adresse' => '',
@@ -71,7 +72,7 @@ class prixcarburants extends eqLogic
 			$nom = $unvehicule->getName();
 			$rayon = $unvehicule->getConfiguration('rayon', '30');
 			$nbstation = $unvehicule->getConfiguration('nbstation', '0');
-      		$PathToLogo = '../../plugins/' . __CLASS__ . '/data/logo/';
+      		
 			
 			$typecarburant = $unvehicule->getConfiguration('typecarburant', '');
 			if ($typecarburant == '') log::add('prixcarburants', 'error', __('Le type de carburant n\'est pas renseigné dans la configuration de Prix Carburants : ', __FILE__) . $nom);
@@ -126,6 +127,7 @@ class prixcarburants extends eqLogic
 			//Prepare and parse XML file
 
 			//check price list existance.
+			
 			$xmlPath = self::ZIP_PATH . '/PrixCarburants_instantane.xml';
 			log::add(__CLASS__, 'debug', 'path :' . realpath($xmlPath));
 			$reader = XMLReader::open($xmlPath);
@@ -137,69 +139,45 @@ class prixcarburants extends eqLogic
 			while ($reader->read()) {
               	
 				if ($reader->nodeType == XMLReader::ELEMENT && $reader->name == 'pdv') {
-					$lat = $reader->getAttribute('latitude') / 100000;
-					$lng = $reader->getAttribute('longitude') / 100000;
-					$mastationid = $reader->getAttribute('id');
-					$MaStationDep = intval(substr($reader->getAttribute('cp'), 0, 2));
-					$MonTest = False;
-					$EstFavoris = False;
+                  	$station = new pxc_station($reader);// creation of a new instance of pxc station to carry out any calculation in station
+					$MonTest = false;
+					$EstFavoris = false;
 
-					//Distance only when localisation define
-					$dist = 0;
-					if ($malat != 0 && $malng != 0) $dist = self::distance($malat, $malng, $lat, $lng);
+					//Distance
+					$dist = $station->distance($malat, $malng);
 					
 					//Check if this station is a favorite
-					$MonTest  = $EstFavoris = in_array($mastationid, $StationFav) && in_array($MaStationDep, $DepartementFav);
-					$ordreFav = $EstFavoris?(array_search($mastationid, $StationFav)-1):0;
-                  	
+					$MonTest  = $EstFavoris = in_array($station->id, $StationFav) && in_array($station->stationDep, $DepartementFav);
+					$ordreFav = $EstFavoris?(array_search($station->id, $StationFav)-1):0;
 					if ($EstFavoris == false && $unvehicule->getConfiguration('ViaLoca') == '1' ) $MonTest = $dist <= $rayon;
-
 					//Register only station that are a favorite or on max radius
 					if ($MonTest == false) continue;
-                  
+					
                   	// general variable
-                  	$marque = prixcarburants::getMarqueStation($mastationid, $MaStationDep);
-                  	$LogoName = strtoupper(str_replace(' ', '', $marque));
-                  	$logo =file_exists(self::ZIP_PATH . '/logo/' . $LogoName . '.png')?$PathToLogo . $LogoName . '.png':$PathToLogo . 'AUCUNE.png';
-					$unestation = simplexml_import_dom($doc->importNode($reader->expand(), true));
-                  	$prixlitre = self::getPriceFromStationXML($unestation, $typecarburant);
+					$station->caculatePrice($typecarburant);//calculate price
                   	$computePrice = true;//flag to test if we should consider price if outdated base
-                    if ($prixlitre && $dminus5 >= strtotime($prixlitre['maj']))$computePrice=!$should_ignore;
-                  	
+                    if ($station->prix && $dminus5 >= strtotime($station->prix['maj']))$computePrice=!$should_ignore;
+					log::add(__CLASS__,'debug',  'Compute station - fav : '.($EstFavoris?1:0).' // test '.($MonTest?1:0).' // computeprx :'.($computePrice?1:0));
+
                     if($EstFavoris){
-                   		$SelectionFav[$ordreFav]['adresse'] = $marque . ', ' . $unestation->ville;
-                        $SelectionFav[$ordreFav]['adressecompl'] = $unestation->adresse . ", " . $reader->getAttribute('cp') . ' ' . $unestation->ville;
-                        $SelectionFav[$ordreFav]['prix'] = $computePrice && $prixlitre?$prixlitre['prix']:0;
-                        $SelectionFav[$ordreFav]['maj'] = self::TranslateDate($monformatdate, config::byKey('language'), strtotime($prixlitre['maj']));
-                        $SelectionFav[$ordreFav]['distance'] = $dist;
-                        $SelectionFav[$ordreFav]['id'] = $mastationid;
-                        $SelectionFav[$ordreFav]['coord'] = $lat . "," . $lng;
-                        $SelectionFav[$ordreFav]['waze'] = $urlWaze . 'to=ll.' . urlencode($lat . ',' . $lng) . '&from=ll.' . urlencode($malat . ',' . $malng) . '&navigate=yes';
-                        $SelectionFav[$ordreFav]['googleMap'] = $urlMap . urlencode($malat . ',' . $malng) . '&destination=' . urlencode($lat . ',' . $lng);
-                        $SelectionFav[$ordreFav]['logo'] = $logo;
-                      	$SelectionFav[$ordreFav]['fuelFound'] = $prixlitre?true:false;
+                      	$station->computeAllDatas($typecarburant, $malat, $malng, $monformatdate);
+						$SelectionFav[$ordreFav] = $station->getDescArray();
+						
+                        if(!$computePrice)$SelectionFav[$ordreFav]['prix'] = 0;
+                      	$SelectionFav[$ordreFav]['fuelFound'] = $station->prix?true:false;
                     
-                    }elseif($prixlitre && $computePrice){// not a favorite but in distance AND if has price found (carburant type founded) AND Date Ok
-                      	$maselection[$idx]['adresse'] = $marque . ', ' . $unestation->ville;
-                        $maselection[$idx]['adressecompl'] = $unestation->adresse . ", " . $reader->getAttribute('cp') . ' ' . $unestation->ville;
-                        $maselection[$idx]['prix'] = $computePrice && $prixlitre?$prixlitre['prix']:0;
-                        $maselection[$idx]['maj'] = self::TranslateDate($monformatdate, config::byKey('language'), strtotime($prixlitre['maj']));
-                        $maselection[$idx]['distance'] = $dist;
-                        $maselection[$idx]['id'] = $mastationid;
-                        $maselection[$idx]['coord'] = $lat . "," . $lng;
-                        $maselection[$idx]['waze'] = $urlWaze . 'to=ll.' . urlencode($lat . ',' . $lng) . '&from=ll.' . urlencode($malat . ',' . $malng) . '&navigate=yes';
-                        $maselection[$idx]['googleMap'] = $urlMap . urlencode($malat . ',' . $malng) . '&destination=' . urlencode($lat . ',' . $lng);
-                        $maselection[$idx]['logo'] = $logo;
+                    }elseif($station->prix && $computePrice){// not a favorite but in distance AND if has price found (carburant type founded) AND Date Ok
+						$station->computeAllDatas($typecarburant, $malat, $malng, $monformatdate);
+						$maselection[$idx]= $station->getDescArray();
+						if(!$computePrice)$maselection[$idx]['prix'] = 0;
                         $idx++;
                     }
-
-
-                  
+                 
 				}
+				
 			}
 			$reader->close();
           
-
 			log::add('prixcarburants', 'debug', 'Step count selection: ' . count($maselection) . ' for equipement: ' . $nom);
 
 			//Sort by price, if needed (for favorite)
@@ -245,22 +223,6 @@ class prixcarburants extends eqLogic
 			}
 			$unvehicule->refreshWidget();
 	}
-  	/** getPriceFromStationXML : allow to get an array with keys : 'prix' for price corresponding at $typecarburant and 'maj' for update date corresponding
-    * $unestation : xml node extracted
-    * $typecarburant : the tyep of carburant 
-    * return false if carburant not found in the list
-    */
-  	public static function getPriceFromStationXML($unestation, $typecarburant){
-      foreach ($unestation->prix as $prix) {
-        if ($prix->attributes()->nom == $typecarburant) { //Filter by fuel type
-         
-          $prixlitre = $prix->attributes()->valeur . '';
-          $maj = $prix->attributes()->maj . '';
-           return array('prix'=>$prixlitre, 'maj'=>$maj);
-        }
-      }
-      return false;
-    }
   	/** Function updateVehiculeCmd : use to save current top 
     * $vId : eqLogic Id of the current equipement
     * $currTop : integer : current top to be recorded
@@ -322,24 +284,6 @@ class prixcarburants extends eqLogic
 		}
 	}
 	
-	/** Function to get the brand of a fuel station */
-	public static function getMarqueStation($idstation, $DepStation)
-	{
-		$json = @file_get_contents(self::ZIP_PATH . '/listestations/stations' . $DepStation . '.json');
-		if ($json !== false) {
-			//log::add(__CLASS__, 'debug', 'JSON file : ' . self::ZIP_PATH . '/data/listestations/stations' . $DepStation . '.json available');
-			$parsed_json = json_decode($json, true);
-			foreach ($parsed_json['stations'] as $row) {
-				if ($row['id'] == $idstation) {
-					return $row['marque'];
-					break;
-				}
-			}
-		} else {
-			log::add(__CLASS__, 'debug', 'JSON file : ' . self::ZIP_PATH . '/listestations/stations' . $DepStation . '.json not available');
-			return __('Erreur', __FILE__);
-		}
-	}
 
 
 	/*     * ********************* Cron management from configuration ************************* */
@@ -909,21 +853,6 @@ class prixcarburants extends eqLogic
 
 
 	/*     * ********************* Global functions ************************* */
-
-	/** Function to calculate a distance between selected location and a station */
-	public static function distance($lat1, $lng1, $lat2, $lng2, $unit = 'k')
-	{
-		$earth_radius = 6378137;	// Terre = sphère de 6378km de rayon
-		$rlo1 = deg2rad($lng1);
-		$rla1 = deg2rad($lat1);
-		$rlo2 = deg2rad($lng2);
-		$rla2 = deg2rad($lat2);
-		$dlo = ($rlo2 - $rlo1) / 2;
-		$dla = ($rla2 - $rla1) / 2;
-		$a = (sin($dla) * sin($dla)) + cos($rla1) * cos($rla2) * (sin($dlo) * sin($dlo));
-		$d = 2 * atan2(sqrt($a), sqrt(1 - $a));
-		return round(($earth_radius * $d) / 1000);
-	}
 
 	/** Function to sort fuel station */
 	public static function custom_sort($a, $b)
